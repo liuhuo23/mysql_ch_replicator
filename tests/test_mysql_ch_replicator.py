@@ -420,6 +420,71 @@ def test_parse_mysql_table_structure():
     assert structure.table_name == 'user_preferences_portal'
 
 
+def test_parse_mysql_table_structure_skips_key_definitions():
+    converter = MysqlToClickhouseConverter()
+    sync_log_ddl = (
+        "CREATE TABLE `sync_log` ("
+        "`id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,"
+        "`province` varchar(64) NOT NULL,"
+        "`md5` char(32) NOT NULL,"
+        "`status` tinyint(4) NOT NULL DEFAULT '0',"
+        "PRIMARY KEY (`id`), KEY `idx_md5_province_status` (`md5`,`province`,`status`), "
+        "KEY `idx_province` (`province`), KEY `idx_status` (`status`)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+    structure = converter.parse_mysql_table_structure(sync_log_ddl)
+
+    assert structure.table_name == 'sync_log'
+    assert structure.primary_keys == ['id']
+    assert [field.name for field in structure.fields] == ['id', 'province', 'md5', 'status']
+    converter.convert_table_structure(structure)
+
+
+def test_parse_mysql_table_structure_skips_index_definitions():
+    converter = MysqlToClickhouseConverter()
+    sync_log_ddl = (
+        "CREATE TABLE IF NOT EXISTS `barn`.`sync_log` ("
+        "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,"
+        "`province` VARCHAR(64) NOT NULL,"
+        "`md5` CHAR(32) NOT NULL,"
+        "`status` TINYINT NOT NULL DEFAULT 0,"
+        "`created_at` DATETIME NOT NULL,"
+        "PRIMARY KEY (`id`),"
+        "INDEX `idx_md5_province_status` (`md5`, `province`, `status`),"
+        "INDEX `idx_province_status` (`province`, `status`),"
+        "INDEX `idx_created_at` (`created_at`)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+    structure = converter.parse_mysql_table_structure(sync_log_ddl)
+
+    assert structure.table_name == 'sync_log'
+    assert structure.primary_keys == ['id']
+    assert [field.name for field in structure.fields] == [
+        'id', 'province', 'md5', 'status', 'created_at',
+    ]
+    converter.convert_table_structure(structure)
+
+
+def test_parse_mysql_table_structure_skips_leading_comma_key():
+    converter = MysqlToClickhouseConverter()
+    query = (
+        "CREATE TABLE `sync_log` ("
+        "`id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,"
+        "`md5` char(32) NOT NULL,"
+        "PRIMARY KEY (`id`),"
+        ", KEY `idx_md5` (`md5`)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+    structure = converter.parse_mysql_table_structure(query)
+
+    assert structure.primary_keys == ['id']
+    assert [field.name for field in structure.fields] == ['id', 'md5']
+    converter.convert_table_structure(structure)
+
+
 def test_alter_tokens_split():
     examples = [
         # basic examples from the prompt:
@@ -464,6 +529,70 @@ def test_alter_rename_index_is_ignored():
         "ALTER TABLE `mydb`.`mytable` RENAME INDEX `idx_old` TO `idx_new`",
         "mydb",
     )
+
+
+def test_alter_add_drop_column_if_exists():
+    from types import SimpleNamespace
+    from mysql_ch_replicator.table_structure import TableStructure, TableField
+
+    mysql_structure = TableStructure(
+        table_name='mytable',
+        fields=[
+            TableField(name='id', field_type='int'),
+            TableField(name='name', field_type='varchar'),
+        ],
+        primary_keys=['id'],
+    )
+    mysql_structure.preprocess()
+    ch_structure = TableStructure(
+        table_name='mytable',
+        fields=[
+            TableField(name='id', field_type='Int32'),
+            TableField(name='name', field_type='String'),
+        ],
+        primary_keys=['id'],
+    )
+    ch_structure.preprocess()
+
+    executed = []
+
+    class FakeClickhouseApi:
+        def get_on_cluster_clause(self):
+            return ''
+
+        def execute_command(self, query):
+            executed.append(query)
+
+    class FakeConfig:
+        types_mapping = {}
+
+        def is_database_matches(self, db_name):
+            return True
+
+        def is_table_matches(self, table_name):
+            return True
+
+    fake_replicator = SimpleNamespace(
+        state=SimpleNamespace(tables_structure={'mytable': (mysql_structure, ch_structure)}),
+        clickhouse_api=FakeClickhouseApi(),
+        config=FakeConfig(),
+        database='mydb',
+        target_database='mydb',
+        get_target_table_name=lambda table_name: table_name,
+    )
+    converter = MysqlToClickhouseConverter(db_replicator=fake_replicator)
+
+    converter.convert_alter_query(
+        "ALTER TABLE `mydb`.`mytable` ADD COLUMN `age` INT",
+        "mydb",
+    )
+    assert 'ADD COLUMN IF NOT EXISTS `age`' in executed[0]
+
+    converter.convert_alter_query(
+        "ALTER TABLE `mydb`.`mytable` DROP COLUMN `age`",
+        "mydb",
+    )
+    assert 'DROP COLUMN IF EXISTS `age`' in executed[1]
 
 
 def test_enum_conversion():

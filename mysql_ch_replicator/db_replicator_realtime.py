@@ -199,7 +199,14 @@ class DbReplicatorRealtime:
         self.replicator.converter.convert_alter_query(query, db_name)
 
     def handle_create_table_query(self, query, db_name):
-        mysql_structure, ch_structure = self.replicator.converter.parse_create_table_query(query)
+        try:
+            mysql_structure, ch_structure = self.replicator.converter.parse_create_table_query(query)
+        except Exception:
+            logger.error(
+                f'failed to parse CREATE TABLE for database {db_name}, query: {query}',
+                exc_info=True,
+            )
+            raise
         if not self.replicator.config.is_table_matches(mysql_structure.table_name):
             return
         target_table_name = self.replicator.get_target_table_name(mysql_structure.table_name)

@@ -343,6 +343,72 @@ def split_high_level(data, delimiter):
     return segments
 
 
+def _normalize_create_inner_line(line: str) -> str:
+    return line.strip().lstrip(',').strip()
+
+
+def _is_index_definition_line(line: str) -> bool:
+    normalized = _normalize_create_inner_line(line)
+    if not normalized:
+        return True
+
+    lower = normalized.lower()
+    if lower.startswith((
+        'unique key',
+        'unique index',
+        'constraint ',
+        'fulltext key',
+        'spatial key',
+        'fulltext index',
+        'spatial index',
+    )):
+        return True
+    if lower.startswith('fulltext') or lower.startswith('spatial'):
+        return True
+    if lower.startswith('key') or lower.startswith('index'):
+        return True
+    if lower.startswith('unique') and len(lower) > 6 and lower[6:].lstrip().startswith('('):
+        return True
+
+    # Bare index name without KEY prefix, e.g. `idx_md5` (`col1`, `col2`) after bad splits.
+    bare_index_match = re.match(r'^`([^`]+)`\s*\(([^)]+)\)', normalized, re.IGNORECASE)
+    if bare_index_match:
+        inner = bare_index_match.group(2).lower()
+        if not re.search(
+            r'\b(?:int|varchar|char|text|datetime|decimal|tinyint|bigint|smallint|float|double|blob|json|enum|set)\b',
+            inner,
+        ):
+            return True
+
+    return False
+
+
+def _parse_primary_key_segment(line: str) -> tuple[list[str] | None, str]:
+    normalized = _normalize_create_inner_line(line)
+    if not re.match(r'(?is)^primary\s+key\s*\(', normalized):
+        return None, line
+
+    open_paren = normalized.lower().index('(')
+    paren_depth = 0
+    close_paren = None
+    for i in range(open_paren, len(normalized)):
+        if normalized[i] == '(':
+            paren_depth += 1
+        elif normalized[i] == ')':
+            paren_depth -= 1
+            if paren_depth == 0:
+                close_paren = i
+                break
+
+    if close_paren is None:
+        return None, line
+
+    pk_inner = normalized[open_paren + 1:close_paren]
+    primary_keys = [strip_sql_name(column.strip()) for column in pk_inner.split(',') if column.strip()]
+    remainder = normalized[close_paren + 1:].strip().lstrip(',').strip()
+    return primary_keys, remainder
+
+
 def strip_sql_comments(sql_statement):
     return sqlparse.format(sql_statement, strip_comments=True).strip()
 
@@ -941,7 +1007,10 @@ class MysqlToClickhouseConverter:
 
         target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
         on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} ADD COLUMN `{column_name}` {column_type_ch}'
+        query = (
+            f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} '
+            f'ADD COLUMN IF NOT EXISTS `{column_name}` {column_type_ch}'
+        )
         if column_first:
             query += ' FIRST'
         else:
@@ -967,7 +1036,10 @@ class MysqlToClickhouseConverter:
 
         target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
         on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} DROP COLUMN {column_name}'
+        query = (
+            f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} '
+            f'DROP COLUMN IF EXISTS `{column_name}`'
+        )
         if self.db_replicator:
             self.db_replicator.clickhouse_api.execute_command(query)
 
@@ -1526,50 +1598,26 @@ class MysqlToClickhouseConverter:
 
         prev_line = ''
         for line in inner_tokens:
-            line = prev_line + line
+            line = (prev_line + line).strip()
             q_count = line.count('`')
             if q_count % 2 == 1:
                 prev_line = line
                 continue
             prev_line = ''
 
-            if line.lower().startswith('unique key'):
-                continue
-            if line.lower().startswith('key'):
-                continue
-            if line.lower().startswith('constraint'):
-                continue
-            if line.lower().startswith('fulltext'):
-                continue
-            if line.lower().startswith('spatial'):
-                continue
-            # Handle unnamed UNIQUE constraints like "UNIQUE (uuid)" or "UNIQUE(uuid)"
-            # This must be checked after other unique key checks to avoid false positives
-            # We check if "unique" is followed by optional whitespace and then "("
-            # This distinguishes constraints from a field named "unique" (which would be "unique VARCHAR(...)")
-            line_lower = line.strip().lower()
-            if line_lower.startswith('unique') and len(line_lower) > 6:
-                # Check if next non-space character after "unique" is "("
-                remaining = line_lower[6:].lstrip()
-                if remaining.startswith('('):
-                    continue
-            if line.lower().startswith('primary key'):
-                # Define identifier to match column names, handling backticks and unquoted names
-                identifier = (Suppress('`') + Word(alphas + alphanums + '_') + Suppress('`')) | Word(
-                    alphas + alphanums + '_')
-
-                # Build the parsing pattern
-                pattern = CaselessKeyword('PRIMARY') + CaselessKeyword('KEY') + Suppress('(') + delimitedList(
-                    identifier)('column_names') + Suppress(')')
-
-                # Parse the line
-                result = pattern.parseString(line)
-
-                # Extract and process the primary key column names
-                primary_keys = [strip_sql_name(name) for name in result['column_names']]
-
+            primary_keys, remainder = _parse_primary_key_segment(line)
+            if primary_keys is not None:
                 structure.primary_keys = primary_keys
+                if remainder:
+                    for trailing_part in split_high_level(remainder, ','):
+                        if trailing_part.strip() and not _is_index_definition_line(trailing_part):
+                            raise Exception(
+                                f'unexpected trailing clause after PRIMARY KEY: {trailing_part}, '
+                                f'full line: {line}',
+                            )
+                continue
 
+            if _is_index_definition_line(line):
                 continue
 
             line = line.strip()

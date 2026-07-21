@@ -523,3 +523,288 @@ def test_create_table_like():
     db_replicator_runner.stop()
     binlog_replicator_runner.stop()
 
+def test_resume_realtime_after_deleting_state_pckl():
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    mysql.execute(f'''
+CREATE TABLE `{TEST_TABLE_NAME}` (
+    id int NOT NULL AUTO_INCREMENT,
+    name varchar(255),
+    age int,
+    PRIMARY KEY (id)
+);
+    ''')
+
+    mysql.execute(
+        f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('before-reset', 10);",
+        commit=True,
+    )
+
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=CONFIG_FILE)
+    binlog_replicator_runner.run()
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=CONFIG_FILE)
+    db_replicator_runner.run()
+
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1)
+
+    db_replicator_runner.stop()
+
+    state_file = os.path.join(cfg.binlog_replicator.data_dir, TEST_DB_NAME, 'state.pckl')
+    assert os.path.exists(state_file), f'{state_file} should exist before deletion'
+    os.remove(state_file)
+    assert not os.path.exists(state_file), 'state.pckl should be deleted'
+
+    db_replicator_runner = DbReplicatorRunner(
+        TEST_DB_NAME,
+        additional_arguments='--skip_initial_replication',
+        cfg_file=CONFIG_FILE,
+    )
+    db_replicator_runner.run()
+
+    # Give db_replicator enough time to finish skip-initial bootstrap and enter realtime mode.
+    time.sleep(3.0)
+
+    mysql.execute(
+        f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('after-reset', 20), ('after-reset-2', 30);",
+        commit=True,
+    )
+
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) >= 2)
+    assert_wait(lambda: ch.select(TEST_TABLE_NAME, where="name='after-reset-2'")[0]['age'] == 30)
+
+    db_replicator_runner.stop()
+    binlog_replicator_runner.stop()
+
+
+def test_auto_backfill_when_local_binlog_files_missing():
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    mysql.execute(f'''
+CREATE TABLE `{TEST_TABLE_NAME}` (
+    id int NOT NULL AUTO_INCREMENT,
+    name varchar(255),
+    age int,
+    PRIMARY KEY (id)
+);
+    ''')
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('seed', 1);", commit=True)
+
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=CONFIG_FILE)
+    binlog_replicator_runner.run()
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=CONFIG_FILE)
+    db_replicator_runner.run()
+
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1)
+
+    mysql.execute(
+        f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('before-gap', 99);",
+        commit=True,
+    )
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME, where="name='before-gap'")) == 1)
+
+    db_replicator_runner.stop()
+
+    db_binlog_dir = os.path.join(cfg.binlog_replicator.data_dir, TEST_DB_NAME)
+    state_file = os.path.join(db_binlog_dir, 'state.pckl')
+    assert os.path.exists(state_file)
+    saved_state = DbReplicatorState(state_file)
+    assert saved_state.last_processed_transaction is not None
+
+    for file_name in os.listdir(db_binlog_dir):
+        if file_name.endswith('.bin'):
+            os.remove(os.path.join(db_binlog_dir, file_name))
+
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('after-backfill', 2);", commit=True)
+
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=CONFIG_FILE)
+    db_replicator_runner.run()
+
+    assert_wait(
+        lambda: len(ch.select(TEST_TABLE_NAME, where="name='after-backfill'")) == 1,
+        max_wait_time=60.0,
+    )
+    assert_wait(lambda: ch.select(TEST_TABLE_NAME, where="name='after-backfill'")[0]['age'] == 2)
+
+    db_replicator_runner.stop()
+    binlog_replicator_runner.stop()
+
+
+def test_recover_after_transaction_not_found_by_deleting_state():
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    mysql.execute(f'''
+CREATE TABLE `{TEST_TABLE_NAME}` (
+    id int NOT NULL AUTO_INCREMENT,
+    name varchar(255),
+    age int,
+    PRIMARY KEY (id)
+);
+    ''')
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('seed', 1);", commit=True)
+
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=CONFIG_FILE)
+    binlog_replicator_runner.run()
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=CONFIG_FILE)
+    db_replicator_runner.run()
+
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1)
+
+    db_replicator_runner.stop()
+
+    state_file = os.path.join(cfg.binlog_replicator.data_dir, TEST_DB_NAME, 'state.pckl')
+    broken_state = DbReplicatorState(state_file)
+    broken_state.last_processed_transaction = ('mysql-bin.999999', 99999999)
+    broken_state.save()
+
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=CONFIG_FILE)
+    db_replicator_runner.run()
+    assert_wait(lambda: db_replicator_runner.process.poll() is not None, max_wait_time=10.0)
+    assert db_replicator_runner.process.returncode != 0
+
+    os.remove(state_file)
+    db_replicator_runner = DbReplicatorRunner(
+        TEST_DB_NAME,
+        additional_arguments='--skip_initial_replication',
+        cfg_file=CONFIG_FILE,
+    )
+    db_replicator_runner.run()
+
+    time.sleep(2.0)
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('recovered', 2);", commit=True)
+
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME, where="name='recovered'")) == 1, max_wait_time=30.0)
+    assert_wait(lambda: ch.select(TEST_TABLE_NAME, where="name='recovered'")[0]['age'] == 2, max_wait_time=30.0)
+
+    db_replicator_runner.stop()
+    binlog_replicator_runner.stop()
+
+
+def test_new_table_synced_after_realtime_replication_started():
+    new_table_name = 'new_table_after_sync'
+
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    mysql.execute(f'''
+CREATE TABLE `{TEST_TABLE_NAME}` (
+    id int NOT NULL AUTO_INCREMENT,
+    name varchar(255),
+    age int,
+    PRIMARY KEY (id)
+);
+    ''')
+    mysql.execute(
+        f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('initial', 1);",
+        commit=True,
+    )
+
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=CONFIG_FILE)
+    binlog_replicator_runner.run()
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=CONFIG_FILE)
+    db_replicator_runner.run()
+
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1)
+
+    # Confirm realtime replication is active before creating a new table.
+    state_file = os.path.join(cfg.binlog_replicator.data_dir, TEST_DB_NAME, 'state.pckl')
+    assert_wait(lambda: DbReplicatorState(state_file).status.value == 3, max_wait_time=30.0)
+
+    mysql.execute(
+        f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('realtime-row', 99);",
+        commit=True,
+    )
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME, where="name='realtime-row'")) == 1, max_wait_time=30.0)
+    assert_wait(lambda: ch.select(TEST_TABLE_NAME, where="name='realtime-row'")[0]['age'] == 99, max_wait_time=30.0)
+
+    assert new_table_name not in ch.get_tables()
+
+    mysql.execute(f'''
+CREATE TABLE `{new_table_name}` (
+    id int NOT NULL AUTO_INCREMENT,
+    title varchar(255) NOT NULL,
+    amount decimal(10,2),
+    PRIMARY KEY (id)
+);
+    ''')
+
+    assert_wait(lambda: new_table_name in ch.get_tables(), max_wait_time=30.0)
+
+    mysql.execute(
+        f"INSERT INTO `{new_table_name}` (title, amount) VALUES ('new-table-row', 12.34);",
+        commit=True,
+    )
+
+    assert_wait(lambda: len(ch.select(new_table_name)) == 1, max_wait_time=30.0)
+    assert_wait(
+        lambda: len(ch.select(new_table_name, where="title='new-table-row'")) == 1,
+        max_wait_time=30.0,
+    )
+    assert_wait(
+        lambda: float(ch.select(new_table_name, where="title='new-table-row'")[0]['amount']) == 12.34,
+        max_wait_time=30.0,
+    )
+
+    db_replicator_runner.stop()
+    binlog_replicator_runner.stop()
+

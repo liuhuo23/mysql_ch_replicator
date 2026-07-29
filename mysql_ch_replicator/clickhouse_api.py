@@ -40,7 +40,10 @@ SETTINGS index_granularity = 8192
 
 CREATE_DIST_TABLE_QUERY = '''
 CREATE TABLE {if_not_exists} `{db_name}`.`{dist_table_name}` {on_cluster}
-ENGINE = Distributed('{cluster}', '{db_name}', '{table_name}', rand());
+(
+{fields}
+)
+ENGINE = Distributed('{cluster}', '{db_name}', '{table_name}', {sharding_key});
 '''
 
 DELETE_QUERY = '''
@@ -239,8 +242,13 @@ class ClickhouseApi:
         query = query.format(**{'on_cluster': on_cluster}) if '{on_cluster}' in query else query
         return query.strip()
 
-    def get_distributed_table_schema(self, table_name, database, if_not_exists=False): 
+    def get_distributed_table_schema(self, table_name, database, if_not_exists=False, sharding_key='rand()', fields=''):
         # distributed table schema
+        # ``fields`` must be a comma-separated string of "  `name` type" lines,
+        # formatted exactly like the local Replicated table. Without explicit
+        # column definitions, ClickHouse cannot resolve column references in
+        # ``sharding_key`` expressions (e.g. ``cityHash64(id)``) and fails with
+        # ``Missing columns: 'id'`` at CREATE TABLE time.
         table_name = table_name.replace(self.DISTRIBUTED_TABLE_SUFFIX, '') if table_name.endswith(self.DISTRIBUTED_TABLE_SUFFIX) else table_name
         return CREATE_DIST_TABLE_QUERY.format(**{
             'if_not_exists': 'IF NOT EXISTS' if if_not_exists else '',
@@ -248,9 +256,30 @@ class ClickhouseApi:
             'table_name': table_name,
             'dist_table_name': table_name + self.DISTRIBUTED_TABLE_SUFFIX,
             'on_cluster': self.get_on_cluster_clause(),
-            'cluster': self.clickhouse_settings.cluster
+            'cluster': self.clickhouse_settings.cluster,
+            'sharding_key': sharding_key,
+            'fields': fields,
 
         })
+
+    def build_sharding_key(self, primary_keys):
+        """
+        Build a ClickHouse sharding key expression from primary key columns.
+
+        Goal: the same primary key must always route to the same shard, while
+        writes stay evenly distributed across shards.
+
+        - ``cityHash64(pk)`` is deterministic (same input → same shard) and
+          distributes monotonically increasing ids across all shards.
+        - ``rand()`` (the previous default) scatters rows of the same pk across
+          different shards, which breaks ReplacingMergeTree deduplication.
+        """
+        if not primary_keys:
+            # Fallback for tables without a primary key; behaves like the old
+            # default. Without a PK there is no deduplication to preserve anyway.
+            return 'rand()'
+        cols = ', '.join(f'`{pk}`' for pk in primary_keys)
+        return f'cityHash64({cols})'
 
 
     def create_table(self, structure: TableStructure, additional_indexes: list | None = None, additional_partition_bys: list | None = None, additional_order_bys: list | None = None):
@@ -302,7 +331,23 @@ class ClickhouseApi:
         if self.clickhouse_settings.cluster:
             # will fail if shard & replica macros aren't configured in clickhouse-server config
             engine = "ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{database}/{table}/{shard}', '{replica}', _version)"
-            query = self.get_distributed_table_schema(structure.table_name, self.database, structure.if_not_exists) 
+            sharding_key = self.build_sharding_key(structure.primary_keys)
+            logger.info(
+                f'cluster sharding key for {structure.table_name}: {sharding_key} '
+                f'(primary_keys={structure.primary_keys})'
+            )
+            # Distributed 表 schema 必须包含 _version 列，因为
+            # insert() 会把 _version 加到 records_to_insert 的最后一列。
+            # 同时，sharding_key 表达式（如 cityHash64(id)）需要 source context，
+            # 没有完整列定义时 CH 会报 "Missing columns"。
+            fields_with_version = f'{fields},\n    `_version` UInt64'
+            query = self.get_distributed_table_schema(
+                structure.table_name,
+                self.database,
+                structure.if_not_exists,
+                sharding_key=sharding_key,
+                fields=fields_with_version,
+            )
             queries.append(query)
 
 
@@ -466,20 +511,25 @@ class ClickhouseApi:
 
     def get_max_record_version(self, table_name):
         """
-        Query the maximum _version value for a given table directly from ClickHouse.
-        
-        Args:
-            table_name: The name of the table to query
-            
-        Returns:
-            The maximum _version value as an integer, or None if the table doesn't exist
-            or has no records
+        Query the maximum _version value for a given table.
+
+        In cluster mode, use ``clusterAllReplicas`` to query the local
+        ``ReplicatedReplacingMergeTree`` table on every replica in parallel,
+        bypassing the ``Distributed`` engine. This returns the true global max,
+        while ``SELECT MAX(_version) FROM ..._distributed`` aggregates per-shard
+        local max which may lag behind in-flight inserts.
         """
         try:
             if self.clickhouse_settings.cluster:
-                table_name += self.DISTRIBUTED_TABLE_SUFFIX
+                cluster = self.clickhouse_settings.cluster
+                query = (
+                    f"SELECT MAX(_version) AS global_max "
+                    f"FROM clusterAllReplicas('{cluster}', "
+                    f"`{self.database}`.`{table_name}`)"
+                )
+            else:
+                query = f"SELECT MAX(_version) FROM `{self.database}`.`{table_name}`"
 
-            query = f"SELECT MAX(_version) FROM `{self.database}`.`{table_name}`"
             result = self.client.query(query)
             if not result.result_rows or result.result_rows[0][0] is None:
                 logger.warning(f"No records with _version found in table {table_name}")

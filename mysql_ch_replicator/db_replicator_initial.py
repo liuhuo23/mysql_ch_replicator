@@ -85,7 +85,21 @@ class DbReplicatorInitial:
             if self.replicator.is_multi_mysql_to_single_ch:
                 logger.info(f'dropping table {target_table_name} before recreating (multi-mysql-to-single-ch mode)')
                 self.replicator.clickhouse_api.drop_table(target_table_name)
-            
+
+            # In cluster mode the Distributed table's sharding key is part of
+            # CREATE_TABLE_QUERY (see build_sharding_key). ClickHouse does not
+            # support ALTER ... MODIFY sharding_key, so if a stale
+            # {table}_distributed table exists from a previous deployment with
+            # a different sharding key (e.g. rand()), we must drop and recreate
+            # it. The underlying Replicated local table keeps all data.
+            if self.replicator.config.cluster_mode:
+                dist_table_name = target_table_name + self.replicator.clickhouse_api.DISTRIBUTED_TABLE_SUFFIX
+                on_cluster = self.replicator.clickhouse_api.get_on_cluster_clause()
+                self.replicator.clickhouse_api.execute_command(
+                    f'DROP TABLE IF EXISTS '
+                    f'`{self.replicator.clickhouse_api.database}`.`{dist_table_name}` {on_cluster}'
+                )
+
             self.replicator.clickhouse_api.create_table(clickhouse_structure, additional_indexes=indexes, additional_partition_bys=partition_bys, additional_order_bys=order_bys)
 
     def validate_mysql_structure(self, mysql_structure: TableStructure):

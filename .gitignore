@@ -7,3 +7,11 @@ monitoring.log
 .DS_Store
 dist/
 .vscode/
+# 临时 CH 升级和 E2E 配置（不在仓库内）
+clickhouse_upgrade/
+e2e_cluster_config.yaml
+tests/e2e_cluster_config.yaml
+
+# 个人 IDE / 工具
+.codewhale/
+.pi-mind/

@@ -269,7 +269,7 @@ class ClickhouseApi:
         Goal: the same primary key must always route to the same shard, while
         writes stay evenly distributed across shards.
 
-        - ``cityHash64(pk)`` is deterministic (same input → same shard) and
+        - ``sipHash64(pk)`` is deterministic (same input → same shard) and
           distributes monotonically increasing ids across all shards.
         - ``rand()`` (the previous default) scatters rows of the same pk across
           different shards, which breaks ReplacingMergeTree deduplication.
@@ -279,7 +279,7 @@ class ClickhouseApi:
             # default. Without a PK there is no deduplication to preserve anyway.
             return 'rand()'
         cols = ', '.join(f'`{pk}`' for pk in primary_keys)
-        return f'cityHash64({cols})'
+        return f'sipHash64({cols})'
 
 
     def create_table(self, structure: TableStructure, additional_indexes: list | None = None, additional_partition_bys: list | None = None, additional_order_bys: list | None = None):
@@ -369,7 +369,10 @@ class ClickhouseApi:
             self.execute_command(query)
 
     def insert(self, table_name, records, table_structure: TableStructure = None):
-        current_version = self.get_last_used_version(table_name) + 1
+        # G3: _version = 写入时刻毫秒时间戳，保证"更新时间最新" <=> "_version 最大"
+        # 与上批末值取 max+1：防跨批同毫秒并列；重启后字典为空时 last=0，退化为纯时间戳
+        now_ms = int(time.time() * 1000)
+        current_version = max(now_ms, self.get_last_used_version(table_name) + 1)
 
         records_to_insert = []
         for record in records:
@@ -431,7 +434,9 @@ class ClickhouseApi:
             records=len(records_to_insert),
         )
 
-        self.set_last_used_version(table_name, current_version)
+        # G3: 存读用同一个键（原版在上面第 406 行给 table_name 加了 _distributed
+        # 后缀再存，而 insert() 开头用不带后缀的键读，键永不匹配 → 每批从初始值重起）
+        self.set_last_used_version(table_name.replace(self.DISTRIBUTED_TABLE_SUFFIX, ''), current_version)
 
     def erase(self, table_name, field_name, field_values):
         field_name = ','.join(field_name)

@@ -4,6 +4,7 @@ import uuid
 import sqlparse
 import re
 import datetime
+from logging import getLogger
 from pyparsing import Suppress, CaselessKeyword, Word, alphas, alphanums, delimitedList
 import copy
 
@@ -14,6 +15,9 @@ from .enum import (
     extract_enum_or_set_values
 )
 from .mysql_api import MySQLApi
+
+
+logger = getLogger(__name__)
 
 
 CHARSET_MYSQL_TO_PYTHON = {
@@ -666,8 +670,40 @@ class MysqlToClickhouseConverter:
         mysql_field_types = [field.field_type for field in mysql_structure.fields]
         clickhouse_filed_types = [field.field_type for field in clickhouse_structure.fields]
 
+        if len(mysql_field_types) != len(clickhouse_filed_types):
+            mysql_names = [field.name for field in mysql_structure.fields]
+            ch_names = [field.name for field in clickhouse_structure.fields]
+            logger.error(
+                'mysql/ch structure field count mismatch for table `%s`: '
+                'mysql_fields=%s %s, ch_fields=%s %s, only_primary=%s',
+                mysql_structure.table_name,
+                len(mysql_names), mysql_names,
+                len(ch_names), ch_names,
+                only_primary,
+            )
+
         clickhouse_records = []
         for mysql_record in mysql_records:
+            if len(mysql_record) != len(mysql_field_types):
+                field_names = [field.name for field in mysql_structure.fields]
+                ch_names = [field.name for field in clickhouse_structure.fields]
+                logger.error(
+                    'schema mismatch while converting records for table `%s`: '
+                    'binlog_record_fields=%s, mysql_structure_fields=%s %s, '
+                    'ch_structure_fields=%s %s, only_primary=%s, sample_record=%r',
+                    mysql_structure.table_name,
+                    len(mysql_record),
+                    len(field_names), field_names,
+                    len(ch_names), ch_names,
+                    only_primary,
+                    mysql_record,
+                )
+                raise ValueError(
+                    f'schema mismatch for table `{mysql_structure.table_name}`: '
+                    f'binlog record has {len(mysql_record)} fields, '
+                    f'in-memory structure has {len(mysql_field_types)} fields {field_names}. '
+                    f'Likely missed ALTER TABLE (ADD/DROP COLUMN).'
+                )
             clickhouse_record = self.convert_record(
                 mysql_record, mysql_field_types, clickhouse_filed_types, mysql_structure, only_primary,
             )
@@ -683,6 +719,26 @@ class MysqlToClickhouseConverter:
             if only_primary and idx not in mysql_structure.primary_key_ids:
                 clickhouse_record.append(mysql_field_value)
                 continue
+
+            if idx >= len(mysql_field_types) or idx >= len(clickhouse_field_types):
+                field_names = [field.name for field in mysql_structure.fields]
+                logger.error(
+                    'convert_record index out of range for table `%s`: idx=%s, '
+                    'record_fields=%s, mysql_types=%s, ch_types=%s, fields=%s, value=%r',
+                    mysql_structure.table_name,
+                    idx,
+                    len(mysql_record),
+                    len(mysql_field_types),
+                    len(clickhouse_field_types),
+                    field_names,
+                    mysql_field_value,
+                )
+                raise IndexError(
+                    f'convert_record index out of range for table `{mysql_structure.table_name}`: '
+                    f'idx={idx}, record_fields={len(mysql_record)}, '
+                    f'mysql_types={len(mysql_field_types)}, ch_types={len(clickhouse_field_types)}, '
+                    f'fields={field_names}'
+                )
 
             clickhouse_field_value = mysql_field_value
             mysql_field_type = mysql_field_types[idx]

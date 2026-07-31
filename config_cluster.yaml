@@ -1,0 +1,38 @@
+# MySQL 源库连接配置
+mysql:
+  host: '127.0.0.1'             # MySQL 主机地址
+  port: 3306                    # MySQL 端口
+  user: 'root'                  # MySQL 用户名
+  password: 'barn'              # MySQL 密码
+
+# ClickHouse 目标库连接配置（集群模式）
+clickhouse:
+  host: '127.0.0.1'             # ClickHouse 主机地址（可连任一节点）
+  port: 38123                   # ClickHouse HTTP 端口
+  user: 'default'               # ClickHouse 用户名
+  password: 'barn'              # ClickHouse 密码
+  connection_timeout: 30        # 连接超时（秒）
+  send_receive_timeout: 300     # 收发超时（秒）
+  # 集群名称：必须与 ClickHouse 服务端配置一致
+  # 例如 /etc/clickhouse-server/config.d/cluster.xml 中的 <remote_servers> 集群名
+  # 启用后会自动创建 Replicated 表 + Distributed 表，DDL 带 ON CLUSTER
+  cluster: 'barn_cluster'
+
+# Binlog 本地缓存配置（replicator 内部使用）
+binlog_replicator:
+  # 本地 binlog 数据目录，需为可写目录
+  data_dir: '/Volumes/zhaoyajie2/clickhouse/mysql-ch-replicator/data/binlog'
+  records_per_file: 100000      # 每个本地 binlog 文件最多记录数
+  binlog_retention_period: 43200  # 本地 binlog 保留时长（秒），默认 12 小时
+
+# 要同步的 MySQL 库名（支持通配符）
+databases: 'barn'
+# 要同步的表（"*" 表示全部）
+tables: [
+  "*"
+]
+
+log_level: 'info'               # 日志级别：debug / info / warning / error
+optimize_interval: 94608000     # OPTIMIZE 间隔（秒），当前约 3 年
+auto_restart_interval: 3600     # 自动重启间隔（秒）
+initial_replication_batch_size: 5000  # 全量/初始复制每批行数

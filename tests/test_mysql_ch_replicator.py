@@ -595,6 +595,109 @@ def test_alter_add_drop_column_if_exists():
     assert 'DROP COLUMN IF EXISTS `age`' in executed[1]
 
 
+def test_convert_records_schema_mismatch_message():
+    from mysql_ch_replicator.table_structure import TableStructure, TableField
+
+    mysql_structure = TableStructure(
+        table_name='sample_missing',
+        fields=[
+            TableField(name='id', field_type='int'),
+            TableField(name='name', field_type='varchar'),
+        ],
+        primary_keys=['id'],
+    )
+    mysql_structure.preprocess()
+    ch_structure = TableStructure(
+        table_name='sample_missing',
+        fields=[
+            TableField(name='id', field_type='Int32'),
+            TableField(name='name', field_type='String'),
+        ],
+        primary_keys=['id'],
+    )
+    ch_structure.preprocess()
+
+    converter = MysqlToClickhouseConverter()
+    with pytest.raises(ValueError, match='schema mismatch for table `sample_missing`'):
+        converter.convert_records([(1, 'a', 0)], mysql_structure, ch_structure)
+
+
+def test_resync_table_structure_from_mysql_adds_missing_ch_column():
+    from types import SimpleNamespace
+    from mysql_ch_replicator.table_structure import TableStructure, TableField
+    from mysql_ch_replicator.db_replicator_realtime import DbReplicatorRealtime
+
+    mysql_structure = TableStructure(
+        table_name='sample_missing',
+        fields=[
+            TableField(name='id', field_type='int', parameters='NOT NULL'),
+            TableField(name='name', field_type='varchar'),
+        ],
+        primary_keys=['id'],
+    )
+    mysql_structure.preprocess()
+    ch_structure = TableStructure(
+        table_name='sample_missing',
+        fields=[
+            TableField(name='id', field_type='Int32'),
+            TableField(name='name', field_type='Nullable(String)'),
+        ],
+        primary_keys=['id'],
+    )
+    ch_structure.preprocess()
+
+    executed = []
+    saved = {'count': 0}
+
+    class FakeClickhouseApi:
+        def get_on_cluster_clause(self):
+            return ''
+
+        def execute_command(self, query):
+            executed.append(query)
+
+    class FakeMysqlApi:
+        def get_table_create_statement(self, table_name):
+            return (
+                "CREATE TABLE `sample_missing` ("
+                "`id` int NOT NULL, "
+                "`name` varchar(255), "
+                "`file_exists` int NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (`id`)"
+                ")"
+            )
+
+    class FakeState:
+        tables_structure = {'sample_missing': (mysql_structure, ch_structure)}
+
+        def save(self):
+            saved['count'] += 1
+
+    fake_replicator = SimpleNamespace(
+        state=FakeState(),
+        clickhouse_api=FakeClickhouseApi(),
+        mysql_api=FakeMysqlApi(),
+        config=SimpleNamespace(mysql=None, mysql_timezone='UTC', cluster_mode=False),
+        database='barn',
+        target_database='barn',
+        converter=MysqlToClickhouseConverter(),
+        get_target_table_name=lambda table_name: table_name,
+    )
+    fake_replicator.converter.db_replicator = fake_replicator
+
+    realtime = DbReplicatorRealtime(fake_replicator)
+    realtime.upload_records = lambda: None
+    realtime.save_state_if_required = lambda force=False: fake_replicator.state.save()
+
+    realtime.resync_table_structure_from_mysql('sample_missing')
+
+    new_mysql, new_ch = fake_replicator.state.tables_structure['sample_missing']
+    assert [f.name for f in new_mysql.fields] == ['id', 'name', 'file_exists']
+    assert [f.name for f in new_ch.fields] == ['id', 'name', 'file_exists']
+    assert any('ADD COLUMN IF NOT EXISTS `file_exists`' in q for q in executed)
+    assert saved['count'] == 1
+
+
 def test_enum_conversion():
     """
     Test that enum values are properly converted to lowercase in ClickHouse

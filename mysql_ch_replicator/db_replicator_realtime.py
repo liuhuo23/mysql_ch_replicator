@@ -9,6 +9,7 @@ from .table_structure import TableStructure
 from .utils import GracefulKiller, touch_all_files, format_floats
 from .converter import strip_sql_comments
 from .common import Status
+from .mysql_api import MySQLApi
 
 
 logger = getLogger(__name__)
@@ -120,6 +121,111 @@ class DbReplicatorRealtime:
                 result.append(record[idx])
         return ','.join(map(str, result))
 
+    def _ensure_mysql_api(self):
+        if self.replicator.mysql_api is None:
+            self.replicator.mysql_api = MySQLApi(
+                database=self.replicator.database,
+                mysql_settings=self.replicator.config.mysql,
+                mysql_timezone=self.replicator.config.mysql_timezone,
+            )
+
+    def resync_table_structure_from_mysql(self, table_name: str):
+        """
+        Refresh in-memory schema from MySQL and reconcile ClickHouse columns.
+        Used when binlog row width no longer matches the cached table structure
+        (typically a missed ALTER ADD/DROP COLUMN).
+        """
+        self.upload_records()
+        self._ensure_mysql_api()
+
+        old_mysql_structure, old_ch_structure = self.replicator.state.tables_structure[table_name]
+        create_statement = self.replicator.mysql_api.get_table_create_statement(table_name)
+        new_mysql_structure = self.replicator.converter.parse_mysql_table_structure(
+            create_statement, required_table_name=table_name,
+        )
+        new_ch_structure = self.replicator.converter.convert_table_structure(new_mysql_structure)
+        target_table_name = self.replicator.get_target_table_name(table_name)
+        new_ch_structure.table_name = target_table_name
+
+        db_name = self.replicator.target_database
+        on_cluster = self.replicator.clickhouse_api.get_on_cluster_clause()
+        old_ch_names = {field.name for field in old_ch_structure.fields}
+        new_ch_names = {field.name for field in new_ch_structure.fields}
+
+        logger.warning(
+            'resyncing table structure for `%s`: mysql fields %s -> %s, ch fields %s -> %s',
+            table_name,
+            [f.name for f in old_mysql_structure.fields],
+            [f.name for f in new_mysql_structure.fields],
+            [f.name for f in old_ch_structure.fields],
+            [f.name for f in new_ch_structure.fields],
+        )
+
+        table_names_to_alter = [target_table_name]
+        if self.replicator.config.cluster_mode:
+            dist_suffix = self.replicator.clickhouse_api.DISTRIBUTED_TABLE_SUFFIX
+            table_names_to_alter.append(target_table_name + dist_suffix)
+
+        for idx, field in enumerate(new_ch_structure.fields):
+            if field.name in old_ch_names:
+                continue
+            position = ' FIRST' if idx == 0 else f' AFTER `{new_ch_structure.fields[idx - 1].name}`'
+            for alter_table_name in table_names_to_alter:
+                query = (
+                    f'ALTER TABLE `{db_name}`.`{alter_table_name}` {on_cluster} '
+                    f'ADD COLUMN IF NOT EXISTS `{field.name}` {field.field_type}{position}'
+                )
+                self.replicator.clickhouse_api.execute_command(query)
+
+        for field in old_ch_structure.fields:
+            if field.name in new_ch_names:
+                continue
+            for alter_table_name in table_names_to_alter:
+                query = (
+                    f'ALTER TABLE `{db_name}`.`{alter_table_name}` {on_cluster} '
+                    f'DROP COLUMN IF EXISTS `{field.name}`'
+                )
+                self.replicator.clickhouse_api.execute_command(query)
+
+        self.replicator.state.tables_structure[table_name] = (new_mysql_structure, new_ch_structure)
+        self.save_state_if_required(force=True)
+
+    def _get_table_structures_for_records(self, table_name: str, records):
+        mysql_table_structure = self.replicator.state.tables_structure[table_name][0]
+        clickhouse_table_structure = self.replicator.state.tables_structure[table_name][1]
+        if records and len(records[0]) != len(mysql_table_structure.fields):
+            mysql_names = [field.name for field in mysql_table_structure.fields]
+            ch_names = [field.name for field in clickhouse_table_structure.fields]
+            logger.error(
+                'schema mismatch for table `%s` before convert: '
+                'record_fields=%s, mysql_structure_fields=%s %s, ch_structure_fields=%s %s, '
+                'sample_record=%r; refreshing structure from MySQL',
+                table_name,
+                len(records[0]),
+                len(mysql_names), mysql_names,
+                len(ch_names), ch_names,
+                records[0],
+            )
+            self.resync_table_structure_from_mysql(table_name)
+            mysql_table_structure = self.replicator.state.tables_structure[table_name][0]
+            clickhouse_table_structure = self.replicator.state.tables_structure[table_name][1]
+            logger.warning(
+                'schema refreshed for table `%s`: mysql_fields=%s, ch_fields=%s',
+                table_name,
+                [field.name for field in mysql_table_structure.fields],
+                [field.name for field in clickhouse_table_structure.fields],
+            )
+            if len(records[0]) != len(mysql_table_structure.fields):
+                logger.error(
+                    'schema still mismatched after refresh for table `%s`: '
+                    'record_fields=%s, mysql_structure_fields=%s %s',
+                    table_name,
+                    len(records[0]),
+                    len(mysql_table_structure.fields),
+                    [field.name for field in mysql_table_structure.fields],
+                )
+        return mysql_table_structure, clickhouse_table_structure
+
     def handle_insert_event(self, event: LogEvent):
         if self.replicator.config.debug_log_level:
             logger.debug(
@@ -130,9 +236,24 @@ class DbReplicatorRealtime:
         self.replicator.stats.insert_events_count += 1
         self.replicator.stats.insert_records_count += len(event.records)
 
-        mysql_table_structure = self.replicator.state.tables_structure[event.table_name][0]
-        clickhouse_table_structure = self.replicator.state.tables_structure[event.table_name][1]
-        records = self.replicator.converter.convert_records(event.records, mysql_table_structure, clickhouse_table_structure)
+        try:
+            mysql_table_structure, clickhouse_table_structure = self._get_table_structures_for_records(
+                event.table_name, event.records,
+            )
+            records = self.replicator.converter.convert_records(
+                event.records, mysql_table_structure, clickhouse_table_structure,
+            )
+        except Exception:
+            logger.error(
+                'failed to convert insert event: transaction_id=%s, table=%s, '
+                'record_count=%s, first_record_fields=%s',
+                event.transaction_id,
+                event.table_name,
+                len(event.records) if event.records else 0,
+                len(event.records[0]) if event.records else 0,
+                exc_info=True,
+            )
+            raise
 
         current_table_records_to_insert = self.records_to_insert[event.table_name]
         current_table_records_to_delete = self.records_to_delete[event.table_name]
@@ -162,12 +283,24 @@ class DbReplicatorRealtime:
         self.replicator.stats.erase_events_count += 1
         self.replicator.stats.erase_records_count += len(event.records)
 
-        table_structure_ch: TableStructure = self.replicator.state.tables_structure[event.table_name][1]
-        table_structure_mysql: TableStructure = self.replicator.state.tables_structure[event.table_name][0]
-
-        records = self.replicator.converter.convert_records(
-            event.records, table_structure_mysql, table_structure_ch, only_primary=True,
-        )
+        try:
+            table_structure_mysql, table_structure_ch = self._get_table_structures_for_records(
+                event.table_name, event.records,
+            )
+            records = self.replicator.converter.convert_records(
+                event.records, table_structure_mysql, table_structure_ch, only_primary=True,
+            )
+        except Exception:
+            logger.error(
+                'failed to convert erase event: transaction_id=%s, table=%s, '
+                'record_count=%s, first_record_fields=%s',
+                event.transaction_id,
+                event.table_name,
+                len(event.records) if event.records else 0,
+                len(event.records[0]) if event.records else 0,
+                exc_info=True,
+            )
+            raise
         keys_to_remove = [self._get_record_id(table_structure_ch, record) for record in records]
 
         current_table_records_to_insert = self.records_to_insert[event.table_name]
